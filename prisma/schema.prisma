@@ -1,0 +1,165 @@
+// Schema follows ../database-design.md
+// CHECK constraints are added via a raw SQL migration (Prisma cannot declare them).
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pg_trgm]
+}
+
+enum Role {
+  EMPLOYEE
+  ADMIN
+}
+
+enum EquipmentStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum RequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum StockMovementType {
+  RESTOCK // + stock received (also used for initial stock)
+  ADJUST // +/- manual correction, e.g. stock count / damaged (note required)
+  REQUEST_APPROVED // - deducted when a request is approved (request_id required)
+  RETURN // + equipment returned (request_id optional)
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique @db.VarChar(255)
+  passwordHash String   @map("password_hash") @db.VarChar(255)
+  fullName     String   @map("full_name") @db.VarChar(150)
+  role         Role     @default(EMPLOYEE)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  requests         EquipmentRequest[] @relation("RequestRequester")
+  reviewedRequests EquipmentRequest[] @relation("RequestReviewer")
+  auditLogs        AuditLog[]
+  stockMovements   StockMovement[]
+
+  @@index([fullName])
+  @@index([fullName(ops: raw("gin_trgm_ops"))], type: Gin, map: "users_full_name_trgm_idx")
+  @@map("users")
+}
+
+model Category {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @unique @db.VarChar(100)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  equipment Equipment[]
+
+  @@map("categories")
+}
+
+model Equipment {
+  id            String          @id @default(uuid()) @db.Uuid
+  name          String          @db.VarChar(150)
+  categoryId    String          @map("category_id") @db.Uuid
+  stockQuantity Int             @default(0) @map("stock_quantity")
+  status        EquipmentStatus @default(ACTIVE)
+  createdAt     DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime        @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  category       Category           @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  requests       EquipmentRequest[]
+  stockMovements StockMovement[]
+
+  @@index([name])
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "equipment_name_trgm_idx")
+  @@index([status])
+  @@index([categoryId])
+  @@map("equipment")
+}
+
+model EquipmentRequest {
+  id           String        @id @default(uuid()) @db.Uuid
+  requesterId  String        @map("requester_id") @db.Uuid
+  equipmentId  String        @map("equipment_id") @db.Uuid
+  quantity     Int
+  reason       String
+  status       RequestStatus @default(PENDING)
+  rejectReason String?       @map("reject_reason")
+  reviewedById String?       @map("reviewed_by_id") @db.Uuid
+  approvedAt   DateTime?     @map("approved_at") @db.Timestamptz(6)
+  rejectedAt   DateTime?     @map("rejected_at") @db.Timestamptz(6)
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  requester      User                @relation("RequestRequester", fields: [requesterId], references: [id], onDelete: Restrict)
+  reviewedBy     User?               @relation("RequestReviewer", fields: [reviewedById], references: [id], onDelete: Restrict)
+  equipment      Equipment           @relation(fields: [equipmentId], references: [id], onDelete: Restrict)
+  auditLogs      AuditLog[]
+  attachments    RequestAttachment[]
+  stockMovements StockMovement[]
+
+  @@index([status, createdAt])
+  @@index([requesterId, createdAt])
+  @@index([equipmentId])
+  @@map("equipment_requests")
+}
+
+model AuditLog {
+  id         String         @id @default(uuid()) @db.Uuid
+  requestId  String         @map("request_id") @db.Uuid
+  actorId    String         @map("actor_id") @db.Uuid
+  fromStatus RequestStatus? @map("from_status")
+  toStatus   RequestStatus  @map("to_status")
+  note       String?
+  createdAt  DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  request EquipmentRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  actor   User             @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([requestId, createdAt])
+  @@map("audit_logs")
+}
+
+model RequestAttachment {
+  id        String   @id @default(uuid()) @db.Uuid
+  requestId String   @map("request_id") @db.Uuid
+  fileName  String   @map("file_name") @db.VarChar(255)
+  filePath  String   @map("file_path") @db.VarChar(500)
+  mimeType  String   @map("mime_type") @db.VarChar(100)
+  sizeBytes Int      @map("size_bytes")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  request EquipmentRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@index([requestId])
+  @@map("request_attachments")
+}
+
+/// Append-only stock ledger. Invariant: SUM(quantity_change) per equipment = equipment.stock_quantity.
+model StockMovement {
+  id             String            @id @default(uuid()) @db.Uuid
+  equipmentId    String            @map("equipment_id") @db.Uuid
+  type           StockMovementType
+  quantityChange Int               @map("quantity_change")
+  balanceAfter   Int               @map("balance_after")
+  actorId        String            @map("actor_id") @db.Uuid
+  requestId      String?           @map("request_id") @db.Uuid
+  note           String?
+  createdAt      DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  equipment Equipment         @relation(fields: [equipmentId], references: [id], onDelete: Restrict)
+  actor     User              @relation(fields: [actorId], references: [id], onDelete: Restrict)
+  request   EquipmentRequest? @relation(fields: [requestId], references: [id], onDelete: Restrict)
+
+  @@index([equipmentId, createdAt])
+  @@index([requestId])
+  @@index([type, createdAt])
+  @@map("stock_movements")
+}
